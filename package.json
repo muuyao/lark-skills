@@ -1,0 +1,36 @@
+{
+  "name": "@muuyao/lark-skills",
+  "version": "0.1.0",
+  "description": "Universal Lark/Feishu MCP server + skills — works across Claude Code, Codex, Cursor and more",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "lark-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.59.0",
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@sinclair/typebox": "0.34.48"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/muuyao/lark-skills.git"
+  },
+  "keywords": [
+    "lark",
+    "feishu",
+    "mcp",
+    "claude",
+    "skill"
+  ]
+}

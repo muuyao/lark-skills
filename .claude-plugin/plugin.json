@@ -1,0 +1,21 @@
+{
+  "name": "lark",
+  "version": "0.1.0",
+  "description": "Universal Lark/Feishu skills with MCP server for managing messages, docs, bitable, calendar, tasks, sheets, and more. Use when the user mentions 飞书, Lark, Feishu, or wants to interact with Lark/Feishu workspace resources like documents, spreadsheets, databases, calendars, tasks, or chat messages.",
+  "author": {
+    "name": "muuyao",
+    "url": "https://github.com/muuyao"
+  },
+  "repository": "https://github.com/muuyao/lark-skills",
+  "license": "MIT",
+  "keywords": [
+    "lark",
+    "feishu",
+    "飞书",
+    "mcp",
+    "bitable",
+    "calendar",
+    "task",
+    "docs"
+  ]
+}

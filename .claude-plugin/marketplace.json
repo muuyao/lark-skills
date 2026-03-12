@@ -1,0 +1,15 @@
+{
+  "name": "lark-skills",
+  "owner": {
+    "name": "muuyao",
+    "url": "https://github.com/muuyao"
+  },
+  "plugins": [
+    {
+      "name": "lark",
+      "source": "./",
+      "description": "Universal Lark/Feishu skills with MCP server",
+      "version": "0.1.0"
+    }
+  ]
+}
