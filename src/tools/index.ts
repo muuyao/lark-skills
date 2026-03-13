@@ -19,6 +19,7 @@ export async function getAllTools(): Promise<ToolDefinition[]> {
   const { imTools } = await import('./im.js');
   const { sheetsTools } = await import('./sheets.js');
   const { driveTools } = await import('./drive.js');
+  const { docTools } = await import('./doc.js');
   const { wikiTools } = await import('./wiki.js');
   const { searchTools } = await import('./search.js');
   const { commonTools } = await import('./common.js');
@@ -31,6 +32,7 @@ export async function getAllTools(): Promise<ToolDefinition[]> {
     ...imTools,
     ...sheetsTools,
     ...driveTools,
+    ...docTools,
     ...wikiTools,
     ...searchTools,
     ...commonTools,

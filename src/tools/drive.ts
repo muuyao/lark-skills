@@ -12,8 +12,10 @@ import { Type } from '@sinclair/typebox';
 import { json, assertLarkOk, formatToolError } from '../core/helpers.js';
 import { getLarkClient } from '../core/client.js';
 import type { ToolResult } from '../core/helpers.js';
-import * as fs from 'fs/promises';
-import * as path from 'path';
+import * as fs from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
 
 // ===========================================================================
 // Shared types
@@ -775,91 +777,296 @@ const feishuDocComments = {
 };
 
 // ===========================================================================
-// 3. feishu_doc_media — document media management (download only)
-//    Note: insert action omitted because it depends on openclaw-specific
-//    imports (validateLocalMediaRoots, imageSize). Only download is ported.
+// 3. feishu_doc_media — document media management (insert + download)
 // ===========================================================================
 
-const DocMediaSchema = Type.Object({
-  action: Type.Literal('download'),
-  resource_token: Type.String({
-    description: '资源的唯一标识（file_token 用于文档素材，whiteboard_id 用于画板）',
-  }),
-  resource_type: Type.Union([Type.Literal('media'), Type.Literal('whiteboard')], {
-    description: '资源类型：media（文档素材：图片、视频、文件等）或 whiteboard（画板缩略图）',
-  }),
-  output_path: Type.String({
-    description:
-      '保存文件的完整本地路径。可以包含扩展名（如 /tmp/image.png），' +
-      '也可以不带扩展名，系统会根据 Content-Type 自动添加',
-  }),
-});
+const MAX_MEDIA_FILE_SIZE = 20 * 1024 * 1024; // 20MB
 
-interface DocMediaDownloadParams {
+const ALIGN_MAP: Record<string, number> = {
+  left: 1,
+  center: 2,
+  right: 3,
+};
+
+const MEDIA_CONFIG = {
+  image: {
+    block_type: 27,
+    block_data: { image: {} },
+    parent_type: 'docx_image' as const,
+    label: '图片',
+  },
+  file: {
+    block_type: 23,
+    block_data: { file: { token: '' } },
+    parent_type: 'docx_file' as const,
+    label: '文件',
+  },
+};
+
+function extractDocumentId(input: string): string {
+  const trimmed = input.trim();
+  const urlMatch = trimmed.match(/\/docx\/([A-Za-z0-9]+)/);
+  if (urlMatch) return urlMatch[1];
+  return trimmed;
+}
+
+const DocMediaSchema = Type.Union([
+  // INSERT action
+  Type.Object({
+    action: Type.Literal('insert'),
+    doc_id: Type.String({
+      description:
+        '文档 ID 或文档 URL（必填）。支持从 URL 自动提取 document_id',
+    }),
+    file_path: Type.String({
+      description:
+        '本地文件的绝对路径（必填）。图片支持 jpg/png/gif/webp 等，文件支持任意格式，最大 20MB',
+    }),
+    type: Type.Optional(
+      Type.Union([Type.Literal('image'), Type.Literal('file')], {
+        description: '媒体类型："image"（图片，默认）或 "file"（文件附件）',
+      }),
+    ),
+    align: Type.Optional(
+      Type.Union(
+        [
+          Type.Literal('left'),
+          Type.Literal('center'),
+          Type.Literal('right'),
+        ],
+        {
+          description:
+            '对齐方式（仅图片生效）："center"（默认居中）、"left"（居左）、"right"（居右）',
+        },
+      ),
+    ),
+    caption: Type.Optional(
+      Type.String({ description: '图片描述/标题（可选，仅图片生效）' }),
+    ),
+  }),
+
+  // DOWNLOAD action
+  Type.Object({
+    action: Type.Literal('download'),
+    resource_token: Type.String({
+      description:
+        '资源的唯一标识（file_token 用于文档素材，whiteboard_id 用于画板）',
+    }),
+    resource_type: Type.Union(
+      [Type.Literal('media'), Type.Literal('whiteboard')],
+      {
+        description:
+          '资源类型：media（文档素材：图片、视频、文件等）或 whiteboard（画板缩略图）',
+      },
+    ),
+    output_path: Type.String({
+      description:
+        '保存文件的完整本地路径。可以包含扩展名（如 /tmp/image.png），' +
+        '也可以不带扩展名，系统会根据 Content-Type 自动添加',
+    }),
+  }),
+]);
+
+interface InsertParams {
+  action: 'insert';
+  doc_id: string;
+  file_path: string;
+  type?: 'image' | 'file';
+  align?: 'left' | 'center' | 'right';
+  caption?: string;
+}
+
+interface DownloadParams {
   action: 'download';
   resource_token: string;
   resource_type: 'media' | 'whiteboard';
   output_path: string;
 }
 
+type DocMediaParams = InsertParams | DownloadParams;
+
+async function handleInsert(p: InsertParams): Promise<ToolResult> {
+  const client = getLarkClient();
+  const documentId = extractDocumentId(p.doc_id);
+  const mediaType = p.type ?? 'image';
+  const config = MEDIA_CONFIG[mediaType];
+
+  // Validate: only allow files under tmpdir for security
+  const filePath = path.resolve(p.file_path);
+  const tmpDir = os.tmpdir();
+  if (!filePath.startsWith(tmpDir)) {
+    return json({
+      error: `安全限制：仅允许上传 ${tmpDir} 目录下的文件。请先将文件复制到临时目录。`,
+    });
+  }
+
+  // Check file exists and size
+  let fileSize: number;
+  try {
+    const stat = await fs.stat(filePath);
+    fileSize = stat.size;
+  } catch (err) {
+    return json({
+      error: `无法读取文件: ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
+
+  if (fileSize > MAX_MEDIA_FILE_SIZE) {
+    return json({
+      error: `文件 ${(fileSize / 1024 / 1024).toFixed(1)}MB 超过 20MB 限制`,
+    });
+  }
+
+  const fileName = path.basename(filePath);
+
+  // Step 1: Create empty block (append to doc end)
+  const createRes: any = await (
+    client.docx as any
+  ).documentBlockChildren.create({
+    path: { document_id: documentId, block_id: documentId },
+    data: {
+      children: [{ block_type: config.block_type, ...config.block_data }],
+    },
+    params: { document_revision_id: -1 },
+  });
+  assertLarkOk(createRes);
+
+  // File Block returns View Block (block_type: 33) as container,
+  // real File Block ID is in children[0].children[0];
+  // Image Block is direct, block_id in children[0].block_id
+  let blockId: string | undefined;
+  if (mediaType === 'file') {
+    blockId = createRes.data?.children?.[0]?.children?.[0];
+  } else {
+    blockId = createRes.data?.children?.[0]?.block_id;
+  }
+  if (!blockId) {
+    return json({
+      error: `创建 ${config.label} block 失败：未返回 block_id`,
+    });
+  }
+
+  // Step 2: Upload media
+  const uploadRes: any = await (client.drive as any).v1.media.uploadAll({
+    data: {
+      file_name: fileName,
+      parent_type: config.parent_type,
+      parent_node: blockId,
+      size: fileSize,
+      file: createReadStream(filePath),
+      extra: JSON.stringify({ drive_route_token: documentId }),
+    },
+  });
+
+  const fileToken =
+    uploadRes?.file_token ?? uploadRes?.data?.file_token;
+  if (!fileToken) {
+    return json({
+      error: `上传 ${config.label} 失败：未返回 file_token`,
+    });
+  }
+
+  // Step 3: Patch block with file_token
+  const patchRequest: any = { block_id: blockId };
+
+  if (mediaType === 'image') {
+    const alignNum = ALIGN_MAP[p.align ?? 'center'];
+    patchRequest.replace_image = {
+      token: fileToken,
+      align: alignNum,
+      ...(p.caption ? { caption: { content: p.caption } } : {}),
+    };
+  } else {
+    patchRequest.replace_file = { token: fileToken };
+  }
+
+  const patchRes: any = await (
+    client.docx as any
+  ).documentBlock.batchUpdate({
+    path: { document_id: documentId },
+    data: { requests: [patchRequest] },
+    params: { document_revision_id: -1 },
+  });
+  assertLarkOk(patchRes);
+
+  return json({
+    success: true,
+    type: mediaType,
+    document_id: documentId,
+    block_id: blockId,
+    file_token: fileToken,
+    file_name: fileName,
+  });
+}
+
+async function handleDownload(p: DownloadParams): Promise<ToolResult> {
+  const client = getLarkClient();
+
+  let res: any;
+  if (p.resource_type === 'media') {
+    res = await (client.drive as any).v1.media.download({
+      path: { file_token: p.resource_token },
+    });
+  } else {
+    res = await (client.board as any).v1.whiteboard.downloadAsImage({
+      path: { whiteboard_id: p.resource_token },
+    });
+  }
+
+  const stream = res.getReadableStream();
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+  const buffer = Buffer.concat(chunks);
+
+  const contentType: string = res.headers?.['content-type'] || '';
+  let finalPath = p.output_path;
+  const currentExt = path.extname(p.output_path);
+
+  if (!currentExt && contentType) {
+    const mimeType = contentType.split(';')[0].trim();
+    const defaultExt = p.resource_type === 'whiteboard' ? '.png' : undefined;
+    const suggestedExt = MIME_TO_EXT[mimeType] || defaultExt;
+    if (suggestedExt) {
+      finalPath = p.output_path + suggestedExt;
+    }
+  }
+
+  await fs.mkdir(path.dirname(finalPath), { recursive: true });
+
+  try {
+    await fs.writeFile(finalPath, buffer);
+  } catch (err) {
+    return json({
+      error: `保存文件失败: ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
+
+  return json({
+    resource_type: p.resource_type,
+    resource_token: p.resource_token,
+    size_bytes: buffer.length,
+    content_type: contentType,
+    saved_path: finalPath,
+  });
+}
+
 const feishuDocMedia = {
   name: 'feishu_doc_media',
   description:
-    '【以用户身份】文档媒体管理工具。' +
-    '支持下载文档素材或画板缩略图到本地（需要资源 token + 输出路径）。',
+    '文档媒体管理工具。支持两种操作：' +
+    '(1) insert — 在飞书文档末尾插入本地图片或文件（需要文档 ID + 本地文件路径）；' +
+    '(2) download — 下载文档素材或画板缩略图到本地（需要资源 token + 输出路径）。' +
+    '\n\n【重要】insert 仅支持本地文件路径，且文件必须在临时目录下。' +
+    'URL 图片请使用 feishu_create_doc/feishu_update_doc 的 <image url="..."/> 语法。',
   schema: DocMediaSchema,
   async handler(params: unknown): Promise<ToolResult> {
-    const p = params as DocMediaDownloadParams;
+    const p = params as DocMediaParams;
     try {
-      const client = getLarkClient();
-
-      let res: any;
-      if (p.resource_type === 'media') {
-        res = await (client.drive as any).v1.media.download({ path: { file_token: p.resource_token } });
-      } else {
-        res = await (client.board as any).v1.whiteboard.downloadAsImage({
-          path: { whiteboard_id: p.resource_token },
-        });
-      }
-
-      const stream = res.getReadableStream();
-      const chunks: Buffer[] = [];
-      for await (const chunk of stream) {
-        chunks.push(chunk);
-      }
-      const buffer = Buffer.concat(chunks);
-
-      // Determine extension from Content-Type
-      const contentType: string = res.headers?.['content-type'] || '';
-      let finalPath = p.output_path;
-      const currentExt = path.extname(p.output_path);
-
-      if (!currentExt && contentType) {
-        const mimeType = contentType.split(';')[0].trim();
-        const defaultExt = p.resource_type === 'whiteboard' ? '.png' : undefined;
-        const suggestedExt = MIME_TO_EXT[mimeType] || defaultExt;
-        if (suggestedExt) {
-          finalPath = p.output_path + suggestedExt;
-        }
-      }
-
-      await fs.mkdir(path.dirname(finalPath), { recursive: true });
-
-      try {
-        await fs.writeFile(finalPath, buffer);
-      } catch (err) {
-        return json({
-          error: `failed to save file: ${err instanceof Error ? err.message : String(err)}`,
-        });
-      }
-
-      return json({
-        resource_type: p.resource_type,
-        resource_token: p.resource_token,
-        size_bytes: buffer.length,
-        content_type: contentType,
-        saved_path: finalPath,
-      });
+      if (p.action === 'insert') return await handleInsert(p);
+      if (p.action === 'download') return await handleDownload(p);
+      return json({ error: `未知的 action: ${(p as any).action}` });
     } catch (err) {
       return formatToolError(err);
     }
